@@ -1,6 +1,6 @@
 # Experimental PF1006 SD probe
 
-**Not tested on hardware. This does not enable ADB or provide a flash/restore
+**Not yet validated on a frame. This does not enable ADB or provide a flash/restore
 procedure.** The first goal is to learn whether a reviewed SD-booted U-Boot build
 can read consistent bytes from this unit's internal MMC device. The model and
 firmware alone do not validate its DRAM configuration or pin assignments.
@@ -154,8 +154,8 @@ are not expected to have identical hashes.
 Validation on 2026-10-16 (UTC) produced a 325,400-byte combined image. The ELF was ARM
 32-bit with entry `0x4a000000`; the card helper accepted its manifest, source and
 configuration snapshots, script CRCs, independent SPL checksum, size and guard
-markers. **This verifies the build and host checks only: no frame boot or hardware
-compatibility test has been performed.** Building does not prepare or write a card.
+markers. **These checks do not establish frame boot or hardware compatibility.**
+Building does not prepare or write a card.
 
 ## Host verification
 
@@ -199,6 +199,12 @@ build directory, an explicit whole-disk identifier, and the exact card byte coun
 It never chooses a disk automatically. The initial implementation accepts only
 external, removable, physical USB media with 512-byte sectors and a capacity of
 4–256 GB. This is the helper's guard, not a statement about every usable reader.
+
+The first real preparation completed on 2026-10-16 with a SanDisk Ultra PLUS
+SDXC UHS-I 64 GB card (63,864,569,856 bytes). MBR/FAT32 began at 16 MiB;
+bootloader/script readback and the saved post-format 4 MiB prefix backup passed,
+and the card was ejected. This validates that preparation run only. The single
+approved frame-boot result is pending; no frame capture or ADB access is verified.
 
 Find the current card identity and exact size each time it is inserted:
 

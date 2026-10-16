@@ -1,7 +1,8 @@
 # Humblestead PF1006: investigation report, ADB not yet enabled
 
-One unit, investigated on 2026-10-15. Stock network ADB refused the connection;
-no SD boot, backup, root access or firmware modification has been demonstrated.
+One unit, investigated on 2026-10-15/16. Stock network ADB refused the connection;
+no successful frame SD boot, frame backup, root access or firmware modification
+has been demonstrated.
 This records an unconfirmed device, not a working unlock procedure.
 
 ## Unit and observations
@@ -50,6 +51,10 @@ mini-USB connectors, unlike the owner's current port report. Its identity,
 wiring and memory configuration must not be assigned to this unit without
 further evidence.
 
+A separate [draft PF1006 V43 report (#151)](https://github.com/wesbos/photo-frame-dashboard/pull/151)
+describes a USB-equipped board on different firmware. It did not use this SD
+diagnostic and does not validate this unit or its experimental build profile.
+
 The experimental [PF1006 prefix probe](../scripts/pf1006-probe/README.md) uses a
 separate build and unique script name. It adds non-SD storage write/erase guards,
 rejects persistent eMMC configuration changes, checks for at least 256 MiB of
@@ -59,8 +64,8 @@ SD readback status and filler. It does not enable ADB or make a full backup.
 
 Host tests exercise the patched C refusal paths and synthetic output corruption.
 They do not establish SD boot or electrical compatibility. The build still starts
-from another board's DRAM, pin and regulator settings. No successful PF1006 run
-has been recorded.
+from another board's DRAM, pin and regulator settings. No successful probe run on
+this frame has been recorded.
 
 On 2026-10-15 the complete image cross-built on the Apple silicon Mac using
 GCC 16.2.0 and binutils 2.47. The resulting ARM executable and packaged artifacts
@@ -68,16 +73,23 @@ passed the host checks, including the independent Allwinner SPL checksum and
 legacy script CRC. The 43 Python tests and both C block-API variants passed.
 Those results establish a buildable diagnostic candidate, not device support.
 
+On 2026-10-16 the macOS card helper completed its first real card preparation:
+a SanDisk Ultra PLUS SDXC UHS-I 64 GB card, measured at 63,864,569,856 bytes.
+The card used MBR/FAT32 with the partition at 16 MiB. Bootloader and script
+readback passed, the saved post-format 4 MiB card-prefix backup verified, and the
+card was ejected successfully. The result of the single owner-approved frame
+boot attempt is still pending; no frame capture, frame backup or ADB access has
+been verified.
+
 ## Next evidence to collect
 
 1. Record the slot type, power connector and every external port. Check the stock
    menus for an ADB/developer option without changing firmware or resetting the
    frame. Keep photographs and logs containing identifiers private.
-2. Before an SD boot attempt, review or adapt a diagnostic-only payload for this
-   board. It should report progress to the removable card, identify the storage
-   devices, and read a small header sample twice. It must not write internal
-   storage or save a persistent U-Boot environment. Treat DRAM configuration and
-   MMC mapping as unconfirmed until there is hardware evidence; a dark screen
+2. After the single approved SD boot attempt, collect the probe's status and
+   prefix with the helper. Its success conditions require two matching reads and
+   verified card output. Treat DRAM configuration and MMC mapping as unconfirmed
+   until there is hardware evidence; a dark screen
    alone proves nothing. Follow the [repository rules](../README.md#rules-we-learned-the-hard-way)
    for the specific payload and card preparation.
 3. If consistent storage reads work, derive the partition map from this unit and
