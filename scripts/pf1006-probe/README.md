@@ -165,7 +165,6 @@ These results apply to that original revision.
 On 2026-10-16, the revised native build completed.
 All 56 Python tests passed: 31 card-helper tests and 25 verifier tests.
 Both C block-API test variants passed.
-**The revised build has not been written to a card.**
 
 ## macOS card helper
 
@@ -174,10 +173,14 @@ It requires a build directory, whole-disk identifier and exact card capacity in 
 It accepts only external, removable, physical USB media with 512-byte sectors and a capacity of 4–256 GB.
 This restriction describes the helper, not all possible card readers.
 
-On 2026-10-16, preparation succeeded with a SanDisk Ultra PLUS SDXC UHS-I 64 GB card (63,864,569,856 bytes).
-MBR/FAT32 began at 16 MiB.
-Bootloader/script readback, the saved 4 MiB post-format card backup and eject passed.
-This verifies that preparation run with the original build only.
+On 2026-10-16, the original and revised builds were prepared in separate runs on the same card.
+It was a SanDisk Ultra PLUS SDXC UHS-I 64 GB card with 63,864,569,856 bytes and 512-byte sectors.
+Both runs used MBR/FAT32 with the partition at 16 MiB.
+The revised build passed current-source, artifact and approved image hash checks.
+Its saved preparation state and 4 MiB post-format backup passed verification.
+The helper completion log confirms bootloader/script readback and successful eject.
+After eject, verification checked the saved build, state, backup and completion log.
+Neither run included frame access or an SD boot test.
 
 ### Plan and prepare
 

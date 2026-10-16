@@ -63,7 +63,7 @@ The guide lists these settings and their limits.
   The ARM image passed the independent SPL checksum and script CRC checks.
   At that time, 43 Python tests and both C block-API tests passed.
   These results apply to that build and test revision.
-- On 2026-10-16, the card helper prepared a SanDisk Ultra PLUS SDXC UHS-I 64 GB card.
+- On 2026-10-16, the card helper prepared the original build on a SanDisk Ultra PLUS SDXC UHS-I 64 GB card.
   Its measured capacity was 63,864,569,856 bytes.
   The MBR/FAT32 partition started at 16 MiB.
   Bootloader and script readback passed.
@@ -73,7 +73,12 @@ The guide lists these settings and their limits.
 - On 2026-10-16, the revised native build completed.
   All 56 Python tests passed: 31 card-helper tests and 25 verifier tests.
   Both C block-API test variants passed.
-  This new build has not been written to a card.
+  The revised build passed current-source, artifact and approved image hash checks.
+  The helper prepared it on the same card that day.
+  Saved records confirm 512-byte sectors and the FAT32 partition at 16 MiB.
+  The saved 4 MiB post-format backup passed size and hash checks.
+  The helper completion log confirms bootloader/script readback and successful eject.
+  After eject, verification checked the saved build, state, backup and completion log.
 
 These records establish host validation and card preparation.
 They do not establish frame compatibility.
