@@ -1,0 +1,123 @@
+# EXPERIMENTAL / NOT HARDWARE-TESTED: PF1006 4 MiB prefix probe, never a flash script.
+# Use only with the companion U-Boot build's non-SD write/erase guards. The build
+# must refuse RAM below 256 MiB in SPL before loading U-Boot proper, and again
+# before loading this script at 0x43100000.
+# @RUN_ID@ is replaced by the build helper with a fresh 32-character hex token.
+# Data buffers occupy 32..40 MiB above DRAM base; status is at +48 MiB.
+# Only FAT mmc 0:1 is written. MMC 1 is a candidate, verified as non-SD through
+# `mmc reg read ocr` before reads. No CID, serial, or full environment is exported.
+# U-Boot initialisation still configures DRAM and MMC pins/timing: not validated
+# for PF1006. A successful probe is not a complete backup or proof of ADB support.
+
+setenv pf1006_a 0x42000000
+setenv pf1006_b 0x42400000
+setenv pf1006_e 0x43000000
+setenv pf1006_format 1
+setenv pf1006_run_id @RUN_ID@
+setenv pf1006_stage started
+setenv pf1006_result RUNNING
+setenv pf1006_start_sector 0
+setenv pf1006_sector_count 0x2000
+setenv pf1006_read_bytes 0x400000
+setenv pf1006_read1_sha256 pending
+setenv pf1006_read2_sha256 pending
+setenv pf1006_reread not_run
+setenv pf1006_card_verify not_run
+setenv pf1006_media unconfirmed
+setenv pf1006_extcsd_status unavailable
+setenv pf1006_extcsd_rev unknown
+setenv pf1006_extcsd_sec0 unknown
+setenv pf1006_extcsd_sec1 unknown
+setenv pf1006_extcsd_sec2 unknown
+setenv pf1006_extcsd_sec3 unknown
+setenv pf1006_save 'env export -t ${pf1006_e} pf1006_format pf1006_run_id pf1006_stage pf1006_result pf1006_start_sector pf1006_sector_count pf1006_read_bytes pf1006_read1_sha256 pf1006_read2_sha256 pf1006_reread pf1006_card_verify pf1006_media pf1006_extcsd_status pf1006_extcsd_rev pf1006_extcsd_sec0 pf1006_extcsd_sec1 pf1006_extcsd_sec2 pf1006_extcsd_sec3 && fatwrite mmc 0:1 ${pf1006_e} pf1006-probe-status.txt ${filesize}'
+
+if run pf1006_save; then
+  if mmc dev 1; then
+    if mmc reg read ocr 0 pf1006_ocr; then
+      setenv pf1006_media mmc
+    else
+      setenv pf1006_result FAIL_NOT_CONFIRMED_MMC
+    fi
+  else
+    setenv pf1006_result FAIL_SELECT_MMC1
+  fi
+else
+  setenv pf1006_result FAIL_INITIAL_STATUS
+fi
+
+# EXT_CSD is optional metadata. Values are hexadecimal bytes; the host assembles
+# SEC_COUNT little-endian. Reading OCR above already proved MMC rather than SD.
+if test "${pf1006_result}" = RUNNING; then
+  if mmc reg read extcsd 192 pf1006_extcsd_rev && mmc reg read extcsd 212 pf1006_extcsd_sec0 && mmc reg read extcsd 213 pf1006_extcsd_sec1 && mmc reg read extcsd 214 pf1006_extcsd_sec2 && mmc reg read extcsd 215 pf1006_extcsd_sec3; then
+    setenv pf1006_extcsd_status available
+  fi
+  setenv pf1006_stage reading
+  if run pf1006_save; then
+    # fatwrite may select the SD device; explicitly select MMC 1 again.
+    if mmc dev 1; then
+      if mw.b ${pf1006_a} 0xcc ${pf1006_read_bytes} && mw.b ${pf1006_b} 0x33 ${pf1006_read_bytes}; then
+        if mmc read ${pf1006_a} 0 ${pf1006_sector_count}; then
+          if mmc read ${pf1006_b} 0 ${pf1006_sector_count}; then
+            if cmp.b ${pf1006_a} ${pf1006_b} ${pf1006_read_bytes}; then
+              setenv pf1006_reread equal
+              if hash sha256 ${pf1006_a} ${pf1006_read_bytes} pf1006_read1_sha256 && hash sha256 ${pf1006_b} ${pf1006_read_bytes} pf1006_read2_sha256; then
+                if test "${pf1006_read1_sha256}" != "${pf1006_read2_sha256}"; then setenv pf1006_result FAIL_READ_HASHES_DIFFER; fi
+              else
+                setenv pf1006_result FAIL_HASH
+              fi
+            else
+              setenv pf1006_result FAIL_READS_DIFFER
+            fi
+          else
+            setenv pf1006_result FAIL_SECOND_READ
+          fi
+        else
+          setenv pf1006_result FAIL_FIRST_READ
+        fi
+      else
+        setenv pf1006_result FAIL_BUFFER_INIT
+      fi
+    else
+      setenv pf1006_result FAIL_RESELECT_MMC1
+    fi
+  else
+    setenv pf1006_result FAIL_READING_STATUS
+  fi
+fi
+
+if test "${pf1006_result}" = RUNNING; then
+  setenv pf1006_stage saving_prefix
+  if run pf1006_save; then
+    if fatwrite mmc 0:1 ${pf1006_a} pf1006-probe.bin ${pf1006_read_bytes}; then
+      if fatsize mmc 0:1 pf1006-probe.bin && test "${filesize}" = 400000; then
+        if mw.b ${pf1006_b} 0x33 ${pf1006_read_bytes} && fatload mmc 0:1 ${pf1006_b} pf1006-probe.bin ${pf1006_read_bytes}; then
+          if test "${filesize}" = 400000 && cmp.b ${pf1006_a} ${pf1006_b} ${pf1006_read_bytes}; then
+            setenv pf1006_card_verify equal
+          else
+            setenv pf1006_result FAIL_CARD_READBACK
+          fi
+        else
+          setenv pf1006_result FAIL_CARD_RELOAD
+        fi
+      else
+        setenv pf1006_result FAIL_CARD_FILE_SIZE
+      fi
+    else
+      setenv pf1006_result FAIL_CARD_SAVE
+    fi
+  else
+    setenv pf1006_result FAIL_SAVING_STATUS
+  fi
+fi
+
+if test "${pf1006_result}" = RUNNING; then
+  setenv pf1006_result VERIFIED_4MIB_PREFIX
+  setenv pf1006_stage finished
+else
+  setenv pf1006_stage failed
+fi
+# A failed final save leaves an incomplete status, which the host verifier rejects.
+run pf1006_save
+# Never return to an Android/autoboot fallback, even when a command failed above.
+while true; do sleep 60; done
