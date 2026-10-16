@@ -1,21 +1,24 @@
 #!/usr/bin/env python3
-"""Verify an experimental PF1006 probe's 4 MiB prefix, without modifying files.
+"""Check a PF1006 probe's 4 MiB capture. Do not change files.
 
-This is not a backup verifier or a PF1006 compatibility test. Header signatures
-are candidates only; none establishes the partition layout or permits flashing.
-Keep prefix data private: it can contain firmware and unit-specific information.
-Python 3.9+, standard library only.
+This check does not prove hardware compatibility or a complete backup.
+Header signatures are possible matches, not a verified partition map.
+Keep captures private. They can contain firmware and device identifiers.
+Requires Python 3.9 or later. Uses the standard library only.
 """
 
 import argparse
 import hashlib
 import json
+import os
 import re
+import stat
 import struct
 import sys
 from pathlib import Path
 
 PREFIX_BYTES = 4 * 1024 * 1024
+STATUS_LIMIT = 16 * 1024
 STATUS_NAME = "pf1006-probe-status.txt"
 PREFIX_NAME = "pf1006-probe.bin"
 STATUS_KEYS = {
@@ -27,23 +30,51 @@ STATUS_KEYS = {
 
 
 class VerificationError(ValueError):
-    """Probe output is incomplete, inconsistent, or unsuitable as evidence."""
+    """The capture failed a required check."""
 
 
-def parse_status(path):
-    if path.stat().st_size > 16384:
+def read_regular(path, limit):
+    """Read a regular file once. Reject links, excess size and detected changes."""
+    path = Path(path)
+    if not isinstance(limit, int) or limit < 0:
+        raise VerificationError("file size limit is invalid")
+    before = path.lstat()
+    if not stat.S_ISREG(before.st_mode):
+        raise VerificationError("expected a regular file: " + path.name)
+    flags = getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    with open(path, "rb", opener=lambda name, mode: os.open(name, mode | flags)) as stream:
+        opened = os.fstat(stream.fileno())
+        if not stat.S_ISREG(opened.st_mode):
+            raise VerificationError("expected a regular file: " + path.name)
+        if (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino):
+            raise VerificationError("file changed before the read: " + path.name)
+        if opened.st_size > limit:
+            raise VerificationError(f"file exceeds {limit} bytes: {path.name}")
+        data = stream.read(limit + 1)
+        after = os.fstat(stream.fileno())
+    if len(data) > limit:
+        raise VerificationError(f"file exceeds {limit} bytes: {path.name}")
+    if (opened.st_size, opened.st_mtime_ns, opened.st_ctime_ns) != (
+            after.st_size, after.st_mtime_ns, after.st_ctime_ns):
+        raise VerificationError("file changed during the read: " + path.name)
+    return data
+
+
+def parse_status_data(raw):
+    if len(raw) > STATUS_LIMIT:
         raise VerificationError("status exceeds 16 KiB")
-    raw = path.read_bytes()
     if not raw.endswith(b"\0") or b"\0" in raw[:-1]:
         raise VerificationError("status must have exactly one final NUL terminator")
     try:
         text = raw[:-1].decode("ascii")
     except UnicodeDecodeError as exc:
         raise VerificationError("status is not ASCII") from exc
+    if any(ord(char) < 32 and char != "\n" or ord(char) == 127 for char in text):
+        raise VerificationError("status contains a control character; use LF line endings")
     if not text.endswith("\n"):
         raise VerificationError("status has an incomplete final line")
     fields = {}
-    for line in text.splitlines():
+    for line in text[:-1].split("\n"):
         key, separator, value = line.partition("=")
         if not separator or not key.startswith("pf1006_"):
             raise VerificationError("unexpected status line")
@@ -56,14 +87,17 @@ def parse_status(path):
     return fields
 
 
+def parse_status(path):
+    return parse_status_data(read_regular(path, STATUS_LIMIT))
+
+
 def signature_candidates(data):
     findings = []
     for name, magic in (("eGON boot0", b"eGON.BT0"),
                         ("Android boot", b"ANDROID!"),
                         ("FDT", b"\xd0\x0d\xfe\xed")):
         offset = 0
-        count = 0
-        while True:
+        for _ in range(64):
             offset = data.find(magic, offset)
             if offset < 0:
                 break
@@ -78,19 +112,18 @@ def signature_candidates(data):
                 item.update(declared_bytes=size,
                             declared_range_in_prefix=40 <= size <= len(data) - offset)
             findings.append(item)
-            count += 1
-            if count >= 64:
-                findings.append({"kind": name, "more_candidates_omitted": True})
-                break
             offset += len(magic)
+        else:
+            if data.find(magic, offset) >= 0:
+                findings.append({"kind": name, "more_candidates_omitted": True})
     return findings
 
 
-def verify(card, expected_run_id):
-    if not re.fullmatch(r"[0-9a-f]{32}", expected_run_id):
+def verify_data(status_data, prefix_data, expected_run_id):
+    """Check these exact bytes. Return the same report as verify()."""
+    if not isinstance(expected_run_id, str) or not re.fullmatch(r"[0-9a-f]{32}", expected_run_id):
         raise VerificationError("expected run ID must be 32 lowercase hexadecimal characters")
-    card = Path(card)
-    fields = parse_status(card / STATUS_NAME)
+    fields = parse_status_data(status_data)
     if fields["run_id"] != expected_run_id:
         raise VerificationError("run ID mismatch: possible output from an earlier build")
     required = {
@@ -106,30 +139,30 @@ def verify(card, expected_run_id):
         raise VerificationError("invalid SHA-256 in status")
     if fields["read2_sha256"] != first_hash:
         raise VerificationError("independent read hashes differ")
-    prefix = card / PREFIX_NAME
-    if prefix.stat().st_size != PREFIX_BYTES:
+    if len(prefix_data) != PREFIX_BYTES:
         raise VerificationError("prefix must be exactly 4 MiB")
-    data = prefix.read_bytes()
-    if len(data) != PREFIX_BYTES:
-        raise VerificationError("prefix changed while reading")
-    if hashlib.sha256(data).hexdigest() != first_hash:
+    if hashlib.sha256(prefix_data).hexdigest() != first_hash:
         raise VerificationError("prefix SHA-256 differs from the on-frame reads")
-    if b"\xcc" * 65536 in data:
+    if b"\xcc" * 65536 in prefix_data:
         raise VerificationError("prefix contains a 64 KiB run of 0xCC filler")
-    if data in (b"\0" * PREFIX_BYTES, b"\xff" * PREFIX_BYTES):
+    if prefix_data in (b"\0" * PREFIX_BYTES, b"\xff" * PREFIX_BYTES):
         raise VerificationError("prefix is entirely zero or 0xFF; not useful evidence")
 
     capacity = None
     revision = None
+    values = []
+    for key in ("extcsd_rev", "extcsd_sec0", "extcsd_sec1", "extcsd_sec2", "extcsd_sec3"):
+        value = fields[key]
+        if value == "unknown" and fields["extcsd_status"] == "unavailable":
+            values.append(None)
+        elif re.fullmatch(r"[0-9a-f]{1,2}", value):
+            values.append(int(value, 16))
+        else:
+            raise VerificationError("invalid EXT_CSD byte: " + key)
     if fields["extcsd_status"] == "available":
-        values = []
-        for key in ("extcsd_rev", "extcsd_sec0", "extcsd_sec1", "extcsd_sec2", "extcsd_sec3"):
-            if not re.fullmatch(r"[0-9a-f]{1,2}", fields[key]):
-                raise VerificationError("invalid EXT_CSD byte: " + key)
-            values.append(int(fields[key], 16))
         revision = values[0]
         sectors = int.from_bytes(bytes(values[1:]), "little")
-        # SEC_COUNT can be zero on small/older devices. Do not invent a capacity.
+        # A zero SEC_COUNT does not give a capacity.
         if sectors:
             capacity = sectors * 512
             if capacity < PREFIX_BYTES:
@@ -139,12 +172,18 @@ def verify(card, expected_run_id):
 
     return {
         "result": "verified_prefix_only", "run_id": expected_run_id,
-        "bytes": len(data), "sha256": first_hash,
+        "bytes": len(prefix_data), "sha256": first_hash,
         "media": "MMC (not SD), according to U-Boot register check",
         "ext_csd_revision": revision, "ext_csd_capacity_bytes": capacity,
-        "signature_candidates": signature_candidates(data),
+        "signature_candidates": signature_candidates(prefix_data),
         "limits": "4 MiB prefix only; not a full backup, unlock, or verified partition map",
     }
+
+
+def verify(card, expected_run_id):
+    card = Path(card)
+    return verify_data(read_regular(card / STATUS_NAME, STATUS_LIMIT),
+                       read_regular(card / PREFIX_NAME, PREFIX_BYTES), expected_run_id)
 
 
 def main(argv=None):
@@ -157,6 +196,8 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if bool(args.compare) != bool(args.compare_run_id):
         parser.error("--compare and --compare-run-id must be supplied together")
+    if args.compare and args.compare_run_id == args.run_id:
+        parser.error("use a different build run ID for the comparison capture")
     try:
         report = verify(args.card, args.run_id)
         if args.compare:
@@ -170,16 +211,16 @@ def main(argv=None):
     if args.json:
         print(json.dumps(report, indent=2))
     else:
-        print("PASS: 4 MiB prefix matches two on-frame reads and SD readback.")
+        print("PASS: The 4 MiB capture matches both frame reads and the SD readback.")
         print("SHA-256: " + report["sha256"])
         if report["ext_csd_capacity_bytes"] is not None:
             print("EXT_CSD user-area capacity: {} bytes".format(report["ext_csd_capacity_bytes"]))
         for candidate in report["signature_candidates"]:
-            print("Signature candidate (not a validated header): " + json.dumps(candidate))
+            print("Possible header (not verified): " + json.dumps(candidate))
         if args.compare:
-            print("Independent capture has the same prefix hash; confirm capture provenance separately.")
+            print("The capture hashes match. Confirm that each capture came from a separate boot.")
         print(report["limits"] + ".")
-        print("Keep the binary and any device-identifying output private.")
+        print("Keep the capture and device identifiers private.")
     return 0
 
 

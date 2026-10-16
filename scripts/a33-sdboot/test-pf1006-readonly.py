@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
-"""Host-only tests for the experimental U-Boot MMC guards; no device is accessed.
+"""Test the experimental U-Boot guards on the host. Do not access a device.
 
 Usage: python3 scripts/a33-sdboot/test-pf1006-readonly.py /path/to/pinned/u-boot
 
-Applies the patch to temporary source files, then compiles the actual patched
-block driver and EXT_CSD functions against an instrumented fake MMC controller.
-The actual SPL sequence is also compiled with fake PMIC return codes, to check
-that a failure at any configured PMIC operation stops later operations and DRAM.
-This verifies software refusal paths, not PF1006 hardware compatibility.
+Apply the patch to temporary copies of the pinned source. Compile the patched
+block driver, EXT_CSD functions, and SPL sequence with fake MMC and PMIC calls.
+Check that each PMIC error stops later operations and DRAM setup.
+These tests check software guards. They do not test PF1006 hardware.
 """
 import argparse
 import os
@@ -19,7 +18,11 @@ import tempfile
 
 HERE = Path(__file__).resolve().parent
 PIN = "e50b1e8715011def8aff1588081a2649a2c6cd47"
-FILES = ("drivers/mmc/mmc_write.c", "drivers/mmc/mmc.c", "board/sunxi/board.c")
+DRIVER = "drivers/mmc/mmc_write.c"
+FUNCTIONS = {
+    "drivers/mmc/mmc.c": ("__mmc_switch", "mmc_switch", "mmc_boot_wp", "mmc_boot_wp_single_partition"),
+    "board/sunxi/board.c": ("board_late_init", "pf1006_require_power_ok", "sunxi_board_init"),
+}
 
 SHIM = r"""
 #include <assert.h>
@@ -197,7 +200,7 @@ int main(void) {
         }
         assert(power_calls == 16 && dram_calls == 1);
     }
-    /* Every PMIC error stops before another regulator call or DRAM setup. */
+    /* Stop after each PMIC error, before another regulator call or DRAM setup. */
     for (int step = 0; step < 16; step++) {
         detected_ram = 1024UL << 20;
         stored_ram = 0;
@@ -205,7 +208,7 @@ int main(void) {
         fail_power_step = step;
         if (!setjmp(hang_jump)) {
             sunxi_board_init();
-            assert(!"PMIC failure incorrectly returned to the loader");
+            assert(!"PMIC error did not stop the loader");
         }
         assert(power_calls == (unsigned)step + 1);
         assert(dram_calls == 0 && stored_ram == 0 && clock_changes == 0);
@@ -230,7 +233,7 @@ int main(void) {
 #else
         struct blk_desc *target = &desc;
 #endif
-        /* eMMC and unknown cards are refused even if enumerated as mmc 0. */
+        /* Refuse eMMC and unknown cards at either device index. */
         for (unsigned version = 0; version < 2; version++) {
             card->version = version;
             for (int part = 0; part < 8; part++) {
@@ -245,7 +248,12 @@ int main(void) {
                 assert(selections == 0 && blocklens == 0 && transfers == 0);
             }
         }
-        /* SD file output remains possible; exercise single and multi-block IO. */
+        /* SD uses partition 0. Check both single-block and multi-block writes. */
+#if TEST_BLK
+        device.desc.hwpart = 0;
+#else
+        desc.hwpart = 0;
+#endif
         card->version = 0x80000000U;
         reset_counts();
         assert(mmc_bwrite(target, 8, 1, data) == 1);
@@ -253,7 +261,7 @@ int main(void) {
         assert(writes == 3 && selections == 2);
         assert(mmc_berase(target, 8, 2) == 2);
         assert(erases > 0);
-        /* Real initialization can configure volatile timing and bus width. */
+        /* Permit the volatile settings used during MMC initialization. */
         card->version = 1;
         for (int index = 0; index < 256; index++) {
             reset_counts();
@@ -265,7 +273,7 @@ int main(void) {
             assert(result == (allowed ? 0 : -EPERM));
             assert(switches == (allowed ? 1U : 0U));
         }
-        /* Only PARTITION_ACCESS may change; boot-selection bits are preserved. */
+        /* Change only PARTITION_ACCESS. Keep the boot-selection bits. */
         card->part_config = 0x48;
         for (unsigned value = 0; value < 256; value++) {
             reset_counts();
@@ -275,30 +283,37 @@ int main(void) {
             assert(result == (allowed ? 0 : -EPERM));
             assert(switches == (allowed ? 1U : 0U));
         }
+        /* Only the normal command set may use the allowed settings. */
+        for (unsigned set = 0; set < 256; set++) {
+            reset_counts();
+            int result = mmc_switch(card, set, EXT_CSD_BUS_WIDTH, 1);
+            bool allowed = set == EXT_CSD_CMD_SET_NORMAL;
+            assert(result == (allowed ? 0 : -EPERM));
+            assert(switches == (allowed ? 1U : 0U));
+        }
         reset_counts();
-        assert(mmc_switch(card, 0, EXT_CSD_BUS_WIDTH, 1) == -EPERM);
         assert(mmc_switch(card, 1, EXT_CSD_ERASE_GROUP_DEF, 2) == -EPERM);
         assert(mmc_boot_wp(card) == -EPERM);
         for (int part = -1; part < 3; part++)
             assert(mmc_boot_wp_single_partition(card, part) == -EPERM);
         assert(switches == 0 && transfers == 0);
     }
-    puts("PASS: block/erase, EXT_CSD, boot-WP, SPL RAM and PMIC failure guards; SD writes retained");
+    puts("PASS: block write/erase, EXT_CSD, boot protection, RAM, and PMIC guards; SD writes work");
     return 0;
 }
 """
 
 
 def function(source, name):
-    """Extract a complete existing C function, preserving its implementation."""
+    """Copy a complete C function without changing its code."""
     match = re.search(r"^(?:static )?(?:int|void) " + re.escape(name) + r"\([^;]+?\n\{", source, re.M)
     if not match:
-        raise RuntimeError(f"missing C function: {name}")
+        raise RuntimeError(f"C function is missing: {name}")
     depth = 1
     end = match.end()
     while depth:
         if end >= len(source):
-            raise RuntimeError(f"unclosed C function: {name}")
+            raise RuntimeError(f"C function has no closing brace: {name}")
         depth += (source[end] == "{") - (source[end] == "}")
         end += 1
     return source[match.start():end] + "\n"
@@ -311,30 +326,25 @@ def main():
     source = args.source.resolve()
     head = subprocess.check_output(["git", "-C", str(source), "rev-parse", "HEAD"], text=True).strip()
     if head != PIN:
-        raise SystemExit(f"STOP: expected U-Boot {PIN}, got {head}")
+        raise SystemExit(f"STOP: Expected U-Boot {PIN}. Found {head}.")
+    cc = os.environ.get("CC", "cc")
+    if not shutil.which(cc):
+        raise SystemExit(f"STOP: C compiler is not available: {cc}")
     with tempfile.TemporaryDirectory(prefix="pf1006-mmc-test-") as folder:
         temp = Path(folder)
-        for name in FILES:
+        for name in (DRIVER, *FUNCTIONS):
             destination = temp / name
             destination.parent.mkdir(parents=True, exist_ok=True)
-            # Read committed source so a previously patched build tree is harmless.
+            # Read the pinned commit. Ignore changes in the source checkout.
             destination.write_bytes(subprocess.check_output(
                 ["git", "-C", str(source), "show", f"{PIN}:{name}"]))
         subprocess.run(["git", "apply", str(HERE / "pf1006-readonly.patch")], cwd=temp, check=True)
-        source_write = (temp / FILES[0]).read_text()
-        source_write = re.sub(r"^#include .*\n", "", source_write, flags=re.M)
-        source_mmc = (temp / FILES[1]).read_text()
-        functions = "\n".join(function(source_mmc, name) for name in (
-            "__mmc_switch", "mmc_switch", "mmc_boot_wp", "mmc_boot_wp_single_partition"))
-        source_board = (temp / FILES[2]).read_text()
-        functions += function(source_board, "board_late_init")
-        functions += function(source_board, "pf1006_require_power_ok")
-        functions += function(source_board, "sunxi_board_init")
+        parts = [SHIM, re.sub(r"^#include .*\n", "", (temp / DRIVER).read_text(), flags=re.M)]
+        for name, functions in FUNCTIONS.items():
+            source_text = (temp / name).read_text()
+            parts.extend(function(source_text, function_name) for function_name in functions)
         test = temp / "test.c"
-        test.write_text(SHIM + source_write + functions + MAIN)
-        cc = os.environ.get("CC", "cc")
-        if not shutil.which(cc):
-            raise SystemExit(f"STOP: C compiler unavailable: {cc}")
+        test.write_text("".join(parts) + MAIN)
         for block_api in (0, 1):
             binary = temp / f"test-{block_api}"
             subprocess.run([cc, "-std=gnu11", "-Wall", "-Wextra", "-Werror",

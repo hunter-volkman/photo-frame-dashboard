@@ -1,91 +1,97 @@
 # Experimental PF1006 SD probe
 
-**Not yet validated on a frame. This does not enable ADB or provide a flash/restore
-procedure.** The first goal is to learn whether a reviewed SD-booted U-Boot build
-can read consistent bytes from this unit's internal MMC device. The model and
-firmware alone do not validate its DRAM configuration or pin assignments.
+**SD boot has not been tested on this unit.**
+It tests whether a reviewed SD boot image can read consistent bytes from internal storage.
+It does not enable ADB or provide a frame flash or restore procedure.
+See the [unit report](../../docs/humblestead-pf1006.md) for the model and firmware evidence.
 
-`probe.cmd.in` is source for a U-Boot script. It must be packaged as
-`pf1006-probe.scr`, never `a33.scr`, and used only with the companion experimental
-build's non-SD write/erase guard patch. Do not load it using an arbitrary PF1007L
-U-Boot build. This README does not authorize a card erase or a device boot.
-Follow the repository's device-write rules and review the concrete build first.
+Review the exact build before card preparation or a frame test.
+Follow the [repository rules for device changes](../../README.md#rules-we-learned-the-hard-way).
+This guide does not supply the owner's approval for those actions.
 
 ## What it does
 
-- Writes progress to `pf1006-probe-status.txt` on FAT partition `mmc 0:1`.
-- Selects `mmc 1` as a candidate internal device. An OCR register read must pass;
-  the pinned U-Boot implementation refuses that command on SD media. CID and
-  other unique identifiers are not exported.
-- Reads sectors 0 through 8191 twice into separate, differently prefilled 4 MiB
-  buffers, compares them byte for byte, and records both SHA-256 values.
-- Saves `pf1006-probe.bin` on the SD card, then reloads it and verifies its exact
-  length and content against the original buffer.
-- Optionally records EXT_CSD revision and SEC_COUNT, without inferring capacity
-  from the marketing specification. These are register reads, not EXT_CSD writes.
-- Writes final status and loops indefinitely; it never starts Android or falls
-  through to another boot source. The outer boot command must also halt if script
-  loading or execution fails.
+The **bootloader** is U-Boot, the startup program loaded from the SD card.
+Its first stage is called SPL.
+The **script**, `pf1006-probe.scr`, contains commands from `probe.cmd.in`.
+A **build** contains the compiled bootloader, its matching script and verification records.
+Use them together; do not substitute a PF1007L bootloader or use the name `a33.scr`.
 
-The source has no internal-storage write command, partition offset, or patch
-application step. The companion guard build blocks non-SD block writes/erases
-and restricts EXT_CSD switching. **This is not a promise of zero hardware state
-changes:** booting still initializes DRAM, powers/configures controllers and
-changes volatile MMC bus timing, width and user-area selection. Those operations
-can fail on an incompatible board. The safeguards must be reviewed in the build,
-not inferred from the script alone.
+The probe selects `mmc 1` as the candidate internal storage.
+Its OCR register read must identify MMC, not SD.
+It reads sectors 0 through 8191 twice into buffers that contain different filler bytes.
+It compares the reads byte for byte and calculates both SHA-256 hashes.
 
-The inherited A33 profile uses the AXP221/AXP223 driver. Its SPL initialization
-actively applies these settings; they are **not measurements from PF1006**:
+It saves a **capture** on SD FAT partition `mmc 0:1`:
+`pf1006-probe-status.txt` and the 4 MiB binary `pf1006-probe.bin`.
+It reloads the binary to verify its length and content before writing final status.
+This storage **prefix** is not a complete backup.
+Optional EXT_CSD register reads record revision and capacity fields, without exporting unique identifiers.
+The script has no internal-storage write, partition offset or patch step.
+
+The probe then remains idle until power is disconnected.
+It does not start Android or try another boot source.
+The outer boot command also stops on script loading or execution failure.
+
+## Hardware limits
+
+The build blocks non-SD block writes and erases and restricts persistent EXT_CSD changes.
+Startup still initializes memory and controllers and changes volatile MMC timing, bus width and user-area selection.
+An incompatible board can fail during these operations.
+The model name and firmware string do not validate these settings.
+
+The inherited A33 profile uses the AXP221/AXP223 power-management driver.
+SPL applies the following settings. **They are not measurements from PF1006.**
 
 | PMIC output | Inherited setting |
 | --- | --- |
-| DCDC1 | 3,000 mV; also enables the DCDC1 switch output |
+| DCDC1 | 3,000 mV; enables the DCDC1 switch output |
 | DCDC2 | 1,100 mV |
 | DCDC3 | 1,200 mV |
 | DCDC5 | 1,500 mV |
 | ALDO1 and ALDO3 | 3,000 mV each |
 | ALDO2 | 2,500 mV |
-| DCDC4, DLDO1–4 and ELDO1–3 | Disabled: their configured value is zero |
+| DCDC4, DLDO1–4 and ELDO1–3 | Disabled; configured value is zero |
 
-The guard halts if PMIC identification/initialization fails, before the regulator
-setters run. It also halts on the first setter error before another setter or
-DRAM initialization. Successfully applied settings are not rolled back. A
-recognized PMIC does not establish that these voltages suit the connected board.
-DRAM remains the inherited 456 MHz / ZQ 15291 experiment, and the successful
-initialization path subsequently requests a 1,008 MHz CPU clock. No PF1006-specific
-voltage changes have been inferred or added.
+If PMIC identification or initialization fails, the guard stops before the regulator setters.
+It stops on the first setter error, without undoing earlier settings.
+A recognized PMIC does not prove that these voltages suit the board.
+Memory retains the 456 MHz clock and ZQ value 15291.
+Successful initialization requests a 1,008 MHz CPU clock.
+No PF1006-specific voltage changes have been added.
 
-Buffers are at `0x42000000` and `0x42400000`, status at `0x43000000`, and the
-script at `0x43100000`. The companion build requires at least **256 MiB RAM**:
-its U-Boot load address is `0x4a000000`, already beyond a 128 MiB board's memory.
-SPL must stop below that minimum before loading U-Boot, and the outer boot command
-must check the detected size again before loading the script. The smaller probe
-buffers do not establish that a board with less RAM can boot this build.
+The build requires **at least 256 MiB of detected RAM** because U-Boot loads at `0x4a000000`.
+SPL stops below this minimum before loading U-Boot.
+The outer boot command checks memory again before loading the script.
+Read buffers use `0x42000000` and `0x42400000`; status uses `0x43000000`; the script uses `0x43100000`.
 
 ## Building the probe
 
-Run these commands from the repository root. Obtain the exact U-Boot source once:
+Run commands from the repository root.
+Obtain the pinned U-Boot source:
 
 ```sh
 git clone --depth 1 --branch v2025.10 https://github.com/u-boot/u-boot.git diagnostics/uboot-pf1006-source
 git -C diagnostics/uboot-pf1006-source checkout --detach e50b1e8715011def8aff1588081a2649a2c6cd47
 ```
 
-`build.sh` refuses any other source HEAD. It archives that commit into a new
-per-run directory, applies the reviewed guard patch there, merges the profile,
-and verifies every requested configuration setting before and after compilation.
-It does not incorporate uncommitted source changes. In particular, Sunxi forces
-`USE_PREBOOT=y`, so the profile explicitly makes `PREBOOT` empty and verifies that
-`PREBOOT_DEFINED` is off. Kernel handoff, PSCI, network, USB and persistent
-environment support are excluded from this diagnostic.
+`build.sh` refuses a different source HEAD and excludes uncommitted U-Boot source changes.
+It archives the pinned commit in a fresh directory, then applies the guard patch and profile.
+It checks all requested settings before and after compilation.
 
-On Linux, the base prerequisites are GNU Make, GCC for the host, an ARM cross GCC
-and binutils, Git, GNU sed/coreutils, tar, bison, flex, SWIG, OpenSSL development
-headers, pkg-config, and Python with development headers, `venv` and setuptools.
-The following base recipe assumes a Python 3.9–3.11 venv with setuptools available;
-the verified Mac environment used setuptools 58.0.4. The requirements file pins
-the additional pyelftools dependency and accepts only its recorded SHA-256 hashes.
+Sunxi requires `USE_PREBOOT=y`.
+The profile makes `PREBOOT` empty and verifies that `PREBOOT_DEFINED` is off.
+Kernel handoff, PSCI, network, USB and persistent environment support are excluded.
+
+### Linux recipe
+
+This recipe was not executed during the validation recorded below.
+Prerequisites are GNU Make, host GCC, ARM cross GCC/binutils, Git, GNU sed/coreutils,
+tar, bison, flex, SWIG, OpenSSL development headers and pkg-config.
+Python also needs development headers, `venv` and setuptools.
+
+Use Python 3.9–3.11 with setuptools in the virtual environment.
+The requirements file pins pyelftools and its SHA-256 hashes.
 
 ```sh
 python3 -m venv diagnostics/pf1006-build-venv
@@ -96,29 +102,30 @@ MAKE=make CROSS_COMPILE=arm-linux-gnueabihf- \
   scripts/pf1006-probe/build.sh diagnostics/uboot-pf1006-source
 ```
 
-For SWIG 4.5, the pinned U-Boot pylibfdt interface still uses two removed Python 2
-compatibility names. Supply
-`HOSTCFLAGS='-DPyInt_AsLong=PyLong_AsLong -DPyString_FromString=PyUnicode_FromString'`
-to the build command. These flags affect host tools only. The Linux recipe was
-not executed during the validation recorded below.
+For SWIG 4.5, supply this setting to the build command:
 
-### Validated native Apple Silicon build
+```sh
+HOSTCFLAGS='-DPyInt_AsLong=PyLong_AsLong -DPyString_FromString=PyUnicode_FromString'
+```
 
-The full cross-build completed on macOS 26.6.2 using ARM GCC 16.2.0, GNU binutils
-2.47.20260726, GNU Make 4.4.1, Apple clang 21.0.0, SWIG 4.5.1, Python 3.9.6 and
-setuptools 58.0.4. The Homebrew `make` formula supplies the `gmake` command.
-With Homebrew and Xcode Command Line Tools already available, the dependencies
-and build recipe used were:
+These aliases replace two removed Python compatibility names in the pinned pylibfdt interface.
+They affect host tools only.
+
+### Verified Apple silicon recipe
+
+The original macOS 26.6.2 build used ARM GCC 16.2.0, binutils 2.47.20260726,
+GNU Make 4.4.1, Apple clang 21.0.0, SWIG 4.5.1, Python 3.9.6 and setuptools 58.0.4.
+
+With Homebrew and Xcode Command Line Tools available, install the dependencies:
 
 ```sh
 brew install arm-none-eabi-gcc arm-none-eabi-binutils make bison swig openssl@3 dtc pkgconf coreutils gnu-sed
 ```
 
-The build requires GNU sed and GNU cp: the pinned upstream configuration merge
-script uses `sed -i` and `cp -T`. This host also required the installed macOS 26.5
-SDK explicitly; the 27 SDK produced a host linker/architecture mismatch. Use a
-compatible installed SDK rather than silently substituting a newer one. The
-following path is the SDK used for the successful build:
+Homebrew supplies GNU Make as `gmake`.
+The upstream merge script requires GNU `sed -i` and `cp -T`.
+This host required the macOS 26.5 SDK; SDK 27 caused a host linker/architecture mismatch.
+If SDK 26.5 is unavailable, resolve the SDK choice before building.
 
 ```sh
 /Library/Developer/CommandLineTools/usr/bin/python3 -m venv diagnostics/pf1006-build-venv
@@ -136,48 +143,158 @@ MAKE=gmake CROSS_COMPILE=arm-none-eabi- HOSTCC=clang HOSTCXX=clang++ \
   scripts/pf1006-probe/build.sh diagnostics/uboot-pf1006-source
 ```
 
-The Python aliases allow the pinned pylibfdt wrapper to compile with SWIG 4.5;
-macOS dynamic lookup allows its Python extension to link. OpenSSL include/library
-paths point to Homebrew's installation. These are host build flags, not ARM
-firmware flags. The helper passes host compiler and Python overrides directly to
-Make, so upstream defaults cannot silently replace them.
+These host flags support SWIG 4.5, macOS Python linking and Homebrew OpenSSL.
+They do not change ARM firmware flags.
+The helper passes compiler and Python overrides directly to Make.
 
-Every invocation creates a fresh run ID under `diagnostics/pf1006-probe/` (or a
-supplied second argument). `build.json` is written only after a successful build.
-It records the pinned commit, tool versions, host flags and hashes for eight
-artifacts: the combined SPL/U-Boot binary, rendered script, packaged script, run
-ID, profile, resolved configuration, guard patch and source template.
-`SHA256SUMS` covers those same artifacts. The files and source/build directories
-remain together for review. Fresh run IDs and timestamps mean repeated builds
-are not expected to have identical hashes.
+### Build output and recorded validation
 
-Validation on 2026-10-16 (UTC) produced a 325,400-byte combined image. The ELF was ARM
-32-bit with entry `0x4a000000`; the card helper accepted its manifest, source and
-configuration snapshots, script CRCs, independent SPL checksum, size and guard
-markers. **These checks do not establish frame boot or hardware compatibility.**
-Building does not prepare or write a card.
+Each invocation creates a fresh **run ID** under `diagnostics/pf1006-probe/`.
+An optional second argument changes the output root.
+After success, `build.json` records the commit, tool versions, host flags and eight artifact hashes.
+`SHA256SUMS` covers the same files: bootloader, rendered script, packaged script, run ID,
+profile, resolved configuration, guard patch and source template.
+Keep them with their source and build directories.
+Fresh run IDs and timestamps change the hashes between builds.
+Building does not write an SD card.
+
+On 2026-10-16 UTC, the original build produced a 325,400-byte image with ARM 32-bit entry `0x4a000000`.
+It passed the card helper's artifact checks, including script CRCs and the independent SPL checksum.
+These results apply to that original revision.
+
+On 2026-10-16, the revised native build completed.
+All 56 Python tests passed: 31 card-helper tests and 25 verifier tests.
+Both C block-API test variants passed.
+**The revised build has not been written to a card.**
+
+## macOS card helper
+
+The helper defaults to a **read-only plan** and never selects a disk automatically.
+It requires a build directory, whole-disk identifier and exact card capacity in bytes.
+It accepts only external, removable, physical USB media with 512-byte sectors and a capacity of 4–256 GB.
+This restriction describes the helper, not all possible card readers.
+
+On 2026-10-16, preparation succeeded with a SanDisk Ultra PLUS SDXC UHS-I 64 GB card (63,864,569,856 bytes).
+MBR/FAT32 began at 16 MiB.
+Bootloader/script readback, the saved 4 MiB post-format card backup and eject passed.
+This verifies that preparation run with the original build only.
+
+### Plan and prepare
+
+Use a spare card whose contents can be erased.
+Each time the card is inserted, find its current disk identifier and exact capacity:
+
+```sh
+diskutil list external physical
+diskutil info diskN
+```
+
+Replace `BUILD_DIR`, `diskN` and `EXACT_BYTES` with the build path and observed values.
+Run the plan:
+
+```sh
+python3 -I scripts/pf1006-probe/card-macos.py BUILD_DIR diskN EXACT_BYTES
+```
+
+The helper checks the pinned commit, manifest, hashes, reviewed snapshots, configuration and run ID.
+It validates script content/CRCs, the SPL header and checksum, image size, guard markers and unique script name.
+It refuses `a33.scr` in the build or on the prepared card.
+These checks reject mixed artifacts; binary markers do not prove hardware compatibility.
+
+After approval for the selected card, run preparation:
+
+```sh
+sudo python3 -I scripts/pf1006-probe/card-macos.py BUILD_DIR diskN EXACT_BYTES --action prepare
+```
+
+The confirmation is `ERASE diskN`, with the actual disk identifier.
+Preparation rechecks identity and erases the card as MBR/FAT32 with a 16 MiB gap.
+It saves and verifies the **post-format** first 4 MiB.
+It writes the bootloader at byte 8192 and copies the unique probe script.
+The bootloader must end before 1 MiB.
+It verifies readback and ejects the card.
+Private identity and backup records stay under ignored `diagnostics/pf1006-probe/cards/RUN_ID/`.
+Interrupted preparation is retained for diagnosis, not automatically retried.
+
+**Use each prepared build for one physical frame boot only.**
+Preparation refuses run ID reuse. A new attempt requires a fresh build and newly prepared card.
+A run ID identifies a build, not individual power cycles.
+If a repeated attempt cannot write status, an earlier success could remain undetected on the card.
+
+### Move the card and test the frame
+
+After review and owner approval, choose an observation interval for the exact build.
+Five minutes is a conservative first-test interval, not a measured completion deadline.
+Record the interval with the result.
+Display output is unverified. A dark screen does not prove success.
+
+1. Wait for the card helper to confirm a successful eject.
+2. Remove the SD card from the Mac's card reader.
+3. Disconnect the frame's power cable.
+4. Insert the SD card into the frame's SD slot.
+5. Reconnect the frame's power cable once.
+6. Observe the frame for the selected interval.
+7. Disconnect the frame's power cable.
+8. Remove the SD card from the frame.
+9. Insert the SD card into the Mac's card reader.
+10. Collect the result with the procedure below.
+
+If the result is absent or incomplete, keep it for diagnosis.
+Do not bypass a failed check or apply a firmware patch.
+
+### Collect
+
+Recheck the card's current disk identifier and exact capacity.
+Use the original build directory for the attempt.
+Run collection without `sudo`:
+
+```sh
+python3 -I scripts/pf1006-probe/card-macos.py BUILD_DIR diskN EXACT_BYTES --action collect
+```
+
+Collection checks saved identity, the original build, the script and the complete capture.
+It mounts read-only if needed; an existing macOS read/write mount can cause OS metadata writes.
+Validated files go to ignored `backups/pf1006-probe/RUN_ID/`; existing destinations are refused.
+The helper verifies the saved copy and ejects the card.
+Keep raw captures and card identity records private.
+
+### Remove the bootloader
+
+Keep the original build directory and private card records until removal is complete.
+Collection and removal accept that original build even if the checkout's source files have changed.
+Run removal with the card's current disk identifier and exact capacity:
+
+```sh
+sudo python3 -I scripts/pf1006-probe/card-macos.py BUILD_DIR diskN EXACT_BYTES --action remove
+```
+
+The confirmation is `REMOVE BOOTLOADER diskN`, with the actual disk identifier.
+Removal checks the saved identity and post-format backup hash.
+It reads the current boot area twice and requires the expected installed bytes.
+It restores that area from the backup and verifies the result.
+It leaves card files intact.
+**It does not recover the card contents erased during preparation.**
+
+Removal also handles interruption after a complete bootloader write, before the final preparation-state save.
+The current prefix must exactly match the expected installed image.
+A partial or changed prefix is refused.
 
 ## Host verification
 
-The build replaces `@RUN_ID@` with a fresh 32-character lowercase hexadecimal
-token and records it locally. Supply that expected token from the build record,
-not one copied from the card's output:
+The build replaces `@RUN_ID@` with a fresh 32-character lowercase hexadecimal token.
+Use the expected run ID from the build record, not the card's output:
 
 ```sh
 python3 -I scripts/pf1006-probe/verify.py /path/to/capture --run-id BUILD_TOKEN
 ```
 
-The verifier reads files only. It requires complete success status, the expected
-run ID, matching hashes from both reads, successful SD readback, and an exactly
-4 MiB file. It rejects truncation, corruption, inconsistent metadata, and 64 KiB
-runs of `0xCC` filler. It reports eGON boot0, Android boot and FDT signature
-**candidates**, without extracting or modifying anything. Signature matches can
-be false positives; they are not a partition map or permission to flash.
-
-Rebuild with a fresh run ID for a new attempt and archive previous output before
-preparing the card. A token distinguishes builds, not individual power cycles:
-reusing the same build with old result files can make an old success look current.
-A missing/unfinished status or a dark screen is not a successful probe.
+The verifier only reads files.
+It requires complete success status, the expected run ID and matching hashes from both storage reads.
+It also requires successful SD readback and an exactly 4 MiB binary file.
+It rejects truncation, corruption, inconsistent metadata and 64 KiB runs of `0xCC` filler.
+It reports eGON boot0, Android boot and FDT signature candidates.
+It does not extract or change their contents.
+A signature can be a false positive; it does not establish a partition map.
 
 To compare two separately verified captures:
 
@@ -186,111 +303,28 @@ python3 -I scripts/pf1006-probe/verify.py /path/to/new --run-id NEW_TOKEN \
   --compare /path/to/prior --compare-run-id PRIOR_TOKEN
 ```
 
-Equal hashes prove equal file content, not that the captures came from independent
-boots. Record that provenance separately. Keep both binary captures private.
-Only the first 4 MiB is read; it may not contain the Android boot partition and
-is not a complete backup. No persistent change should be designed from this
-prefix alone.
-
-## macOS card helper
-
-`card-macos.py` defaults to a **read-only plan**. It accepts a completed per-run
-build directory, an explicit whole-disk identifier, and the exact card byte count.
-It never chooses a disk automatically. The initial implementation accepts only
-external, removable, physical USB media with 512-byte sectors and a capacity of
-4–256 GB. This is the helper's guard, not a statement about every usable reader.
-
-The first real preparation completed on 2026-10-16 with a SanDisk Ultra PLUS
-SDXC UHS-I 64 GB card (63,864,569,856 bytes). MBR/FAT32 began at 16 MiB;
-bootloader/script readback and the saved post-format 4 MiB prefix backup passed,
-and the card was ejected. This validates that preparation run only. The single
-approved frame-boot result is pending; no frame capture or ADB access is verified.
-
-Find the current card identity and exact size each time it is inserted:
-
-```sh
-diskutil list external physical
-diskutil info diskN
-```
-
-Replace `BUILD_DIR`, `diskN`, and `EXACT_BYTES` with observed values:
-
-```sh
-python3 -I scripts/pf1006-probe/card-macos.py BUILD_DIR diskN EXACT_BYTES
-```
-
-Before any disk mutation, the helper checks the pinned U-Boot commit, complete
-manifest and SHA-256 files, reviewed source/profile/guard snapshots, resolved
-configuration, rendered run ID, legacy script CRCs and source content, SPL header
-and its independent little-endian additive checksum,
-boot image size, and guard/unique-script markers in the binary. These checks catch
-mixed or stale artifacts; marker presence does not prove hardware compatibility.
-An `a33.scr` in the build or on the prepared card is refused.
-
-For an explicitly selected spare card whose contents can be erased:
-
-```sh
-sudo python3 -I scripts/pf1006-probe/card-macos.py BUILD_DIR diskN EXACT_BYTES --action prepare
-```
-
-Preparation requires the exact confirmation `ERASE diskN`. It rechecks identity,
-formats MBR/FAT32 with a 16 MB gap, saves and verifies the **post-format** first
-4 MiB, writes only the unique probe script and the bootloader at byte 8192,
-verifies readback, and ejects. The bootloader must end before 1 MiB. Saved card
-identity and backup stay under ignored `diagnostics/pf1006-probe/cards/RUN_ID/`.
-Interrupted preparation is retained for diagnosis; it is not silently retried.
-
-**One physical frame boot per newly prepared build.** Each prepare consumes its
-build token and refuses reuse. After that one attempt, collect the result. A new
-attempt needs a fresh build token and a newly prepared card. The helper cannot
-detect an unreported second power cycle: if all status writes failed, an earlier
-success could still be on the card. Never treat such reused output as new evidence.
-
-After the single frame boot attempt, reinsert the card in the Mac, recheck its
-disk number and size, and collect without `sudo`:
-
-```sh
-python3 -I scripts/pf1006-probe/card-macos.py BUILD_DIR diskN EXACT_BYTES --action collect
-```
-
-Collection checks saved card identity, the original build, the script, and the
-complete capture against the build token. It mounts read-only if a mount is needed,
-copies only validated results into ignored `backups/pf1006-probe/RUN_ID/`, verifies
-the saved copy, and ejects. It refuses existing destinations. Raw firmware bytes
-and the card's identity remain private. Collection does not deliberately change
-card files; an existing macOS read/write mount can still cause OS metadata writes.
-An absent or failed result is diagnostic
-evidence to inspect, not a reason to bypass a check or apply a firmware patch.
-
-To remove this probe's bootloader from a successfully prepared card:
-
-```sh
-sudo python3 -I scripts/pf1006-probe/card-macos.py BUILD_DIR diskN EXACT_BYTES --action remove
-```
-
-Removal requires `REMOVE BOOTLOADER diskN`. It verifies the saved identity,
-post-format backup hash, and two reads of the expected current boot area before
-restoring that area and verifying the result. It leaves card files intact and
-**does not recover the contents erased by preparation**. Keep the original build
-directory and private card state until removal; collection and removal can use
-that original build even if this checkout's source files have since changed.
-Removal also handles an interruption after the complete bootloader write but
-before the final preparation-state save, provided the current prefix exactly
-matches the expected installed image. A partial or changed prefix is refused.
+Equal hashes prove equal file content, not separate frame boots.
+Record each capture's test history separately.
+The first 4 MiB might not contain the Android boot partition.
+Do not design a persistent change from this prefix alone.
 
 ## Offline tests
 
-Python 3.9 or later, standard library only:
+These tests require Python 3.9 or later and use only its standard library:
 
 ```sh
 python3 -I scripts/pf1006-probe/test_verify.py
 python3 -I scripts/pf1006-probe/test_card_macos.py
 ```
 
-These tests use synthetic captures to exercise corruption, truncation, filler,
-stale/unfinished status, capacity decoding and independent-capture comparison.
-Card-helper tests use synthetic builds, regular temporary files and a fake
-`diskutil` interface to exercise disk guards, source/script tampering, stale
-results, refused overwrites, and prepare/collect/restore behavior. No disk device
-is opened by the tests. They do not exercise U-Boot or prove PF1006 hardware
-compatibility.
+Tests cover corrupted captures, stale status, capacity decoding, comparison, disk guards, tampering and prepare/collect/remove behavior.
+They use synthetic builds, temporary files and a fake `diskutil` interface.
+They do not open disk devices or execute U-Boot on hardware.
+
+Run the compiled C guard tests against the pinned U-Boot source:
+
+```sh
+python3 -I scripts/a33-sdboot/test-pf1006-readonly.py diagnostics/uboot-pf1006-source
+```
+
+These tests use the host C compiler and cover both block-API variants.

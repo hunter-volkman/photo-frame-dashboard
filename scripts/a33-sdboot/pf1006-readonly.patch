@@ -6,7 +6,7 @@ diff --git a/drivers/mmc/mmc_write.c b/drivers/mmc/mmc_write.c
  	if (!mmc)
  		return -1;
 +
-+	/* Diagnostic build: SD output only, independent of device order. */
++	/* Do not write or erase non-SD media, at any device index. */
 +	if (!IS_SD(mmc)) {
 +		puts("pf1006 diagnostic: refused non-SD block erase\n");
 +		return 0;
@@ -18,7 +18,7 @@ diff --git a/drivers/mmc/mmc_write.c b/drivers/mmc/mmc_write.c
  	if (!mmc)
  		return 0;
  
-+	/* Diagnostic build: SD output only, independent of device order. */
++	/* Do not write or erase non-SD media, at any device index. */
 +	if (!IS_SD(mmc)) {
 +		puts("pf1006 diagnostic: refused non-SD block write\n");
 +		return 0;
@@ -30,22 +30,23 @@ diff --git a/drivers/mmc/mmc_write.c b/drivers/mmc/mmc_write.c
 diff --git a/drivers/mmc/mmc.c b/drivers/mmc/mmc.c
 --- a/drivers/mmc/mmc.c
 +++ b/drivers/mmc/mmc.c
-@@ -853,6 +853,22 @@
+@@ -853,6 +853,23 @@
  			      (index == EXT_CSD_PART_CONF);
  	int ret;
  
 +	/*
-+	 * Diagnostic build: only volatile settings required to read an eMMC.
-+	 * PARTITION_ACCESS is volatile; preserve all boot-configuration bits.
-+	 * This also refuses boot write protection, BKOPS enable, reset-function,
-+	 * hardware partitioning and other persistent EXT_CSD changes.
++	 * Permit only volatile MMC settings needed to read the device.
++	 * Keep all other PART_CONF bits when changing PARTITION_ACCESS.
++	 * Refuse boot write protection, BKOPS, reset-function changes,
++	 * hardware partitioning, and other persistent EXT_CSD changes.
 +	 */
-+	if (!IS_SD(mmc) &&
-+	    (set != EXT_CSD_CMD_SET_NORMAL ||
-+	     !(index == EXT_CSD_BUS_WIDTH || index == EXT_CSD_HS_TIMING ||
-+	       (index == EXT_CSD_ERASE_GROUP_DEF && value <= 1) ||
-+	       (index == EXT_CSD_PART_CONF &&
-+		(value & ~7) == (mmc->part_config & ~7))))) {
++	bool allowed_switch = set == EXT_CSD_CMD_SET_NORMAL &&
++		(index == EXT_CSD_BUS_WIDTH || index == EXT_CSD_HS_TIMING ||
++		 (index == EXT_CSD_ERASE_GROUP_DEF && value <= 1) ||
++		 (index == EXT_CSD_PART_CONF &&
++		  (value & ~7) == (mmc->part_config & ~7)));
++
++	if (!IS_SD(mmc) && !allowed_switch) {
 +		puts("pf1006 diagnostic: refused persistent EXT_CSD change\n");
 +		return -EPERM;
 +	}
@@ -60,7 +61,7 @@ diff --git a/board/sunxi/board.c b/board/sunxi/board.c
  	spl->dram_size = dram_size >> 20;
  }
  
-+/* This experimental board profile must not continue with uncertain rails. */
++/* Stop if PMIC setup or a voltage change fails. */
 +static void pf1006_require_power_ok(int error)
 +{
 +	if (error) {
@@ -160,7 +161,7 @@ diff --git a/board/sunxi/board.c b/board/sunxi/board.c
  	gd->ram_size = sunxi_dram_init();
  	printf(" %d MiB\n", (int)(gd->ram_size >> 20));
 -	if (!gd->ram_size)
-+	/* U-Boot proper loads at 0x4a000000: do not load it into small DRAM. */
++	/* U-Boot loads at DRAM +160 MiB. Require at least 256 MiB. */
 +	if (gd->ram_size < SZ_256M) {
 +		puts("pf1006 diagnostic: need at least 256 MiB DRAM\n");
  		hang();
@@ -172,7 +173,7 @@ diff --git a/board/sunxi/board.c b/board/sunxi/board.c
  
  int board_late_init(void)
  {
-+	/* Experimental diagnostic scripts must stay within detected DRAM. */
++	/* Give the script the detected RAM size. */
 +	env_set_hex("pf1006_ram_bytes", gd->ram_size);
 +
  #ifdef CONFIG_USB_ETHER

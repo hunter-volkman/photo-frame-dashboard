@@ -1,13 +1,12 @@
-# EXPERIMENTAL / NOT HARDWARE-TESTED: PF1006 4 MiB prefix probe, never a flash script.
-# Use only with the companion U-Boot build's non-SD write/erase guards. The build
-# must refuse RAM below 256 MiB in SPL before loading U-Boot proper, and again
-# before loading this script at 0x43100000.
-# @RUN_ID@ is replaced by the build helper with a fresh 32-character hex token.
-# Data buffers occupy 32..40 MiB above DRAM base; status is at +48 MiB.
-# Only FAT mmc 0:1 is written. MMC 1 is a candidate, verified as non-SD through
-# `mmc reg read ocr` before reads. No CID, serial, or full environment is exported.
-# U-Boot initialisation still configures DRAM and MMC pins/timing: not validated
-# for PF1006. A successful probe is not a complete backup or proof of ADB support.
+# Experimental PF1006 read probe. Not tested on hardware.
+# Use only with the companion U-Boot build. It blocks non-SD writes and erases,
+# stops on PMIC errors, and requires at least 256 MiB RAM before loading U-Boot.
+# The build replaces @RUN_ID@ with a new token. Use each prepared card for one boot.
+# Buffers use DRAM offsets 32..40 MiB; status uses +48 MiB; this script uses +49 MiB.
+# Write files only to FAT mmc 0:1. Confirm that candidate mmc 1 is not SD before
+# reading it. Do not export its CID, serial number, or the full environment.
+# Hardware settings are not verified for PF1006. This is not a full backup or an
+# ADB installer. U-Boot still changes PMIC, DRAM, and MMC controller settings.
 
 setenv pf1006_a 0x42000000
 setenv pf1006_b 0x42400000
@@ -46,15 +45,15 @@ else
   setenv pf1006_result FAIL_INITIAL_STATUS
 fi
 
-# EXT_CSD is optional metadata. Values are hexadecimal bytes; the host assembles
-# SEC_COUNT little-endian. Reading OCR above already proved MMC rather than SD.
+# EXT_CSD metadata is optional. Export bytes as hexadecimal; read SEC_COUNT in
+# little-endian order. The OCR command above succeeds only for MMC, not SD.
 if test "${pf1006_result}" = RUNNING; then
   if mmc reg read extcsd 192 pf1006_extcsd_rev && mmc reg read extcsd 212 pf1006_extcsd_sec0 && mmc reg read extcsd 213 pf1006_extcsd_sec1 && mmc reg read extcsd 214 pf1006_extcsd_sec2 && mmc reg read extcsd 215 pf1006_extcsd_sec3; then
     setenv pf1006_extcsd_status available
   fi
   setenv pf1006_stage reading
   if run pf1006_save; then
-    # fatwrite may select the SD device; explicitly select MMC 1 again.
+    # fatwrite can select the SD device. Select MMC 1 again before the reads.
     if mmc dev 1; then
       if mw.b ${pf1006_a} 0xcc ${pf1006_read_bytes} && mw.b ${pf1006_b} 0x33 ${pf1006_read_bytes}; then
         if mmc read ${pf1006_a} 0 ${pf1006_sector_count}; then
@@ -62,7 +61,9 @@ if test "${pf1006_result}" = RUNNING; then
             if cmp.b ${pf1006_a} ${pf1006_b} ${pf1006_read_bytes}; then
               setenv pf1006_reread equal
               if hash sha256 ${pf1006_a} ${pf1006_read_bytes} pf1006_read1_sha256 && hash sha256 ${pf1006_b} ${pf1006_read_bytes} pf1006_read2_sha256; then
-                if test "${pf1006_read1_sha256}" != "${pf1006_read2_sha256}"; then setenv pf1006_result FAIL_READ_HASHES_DIFFER; fi
+                if test "${pf1006_read1_sha256}" != "${pf1006_read2_sha256}"; then
+                  setenv pf1006_result FAIL_READ_HASHES_DIFFER
+                fi
               else
                 setenv pf1006_result FAIL_HASH
               fi
@@ -117,7 +118,8 @@ if test "${pf1006_result}" = RUNNING; then
 else
   setenv pf1006_stage failed
 fi
-# A failed final save leaves an incomplete status, which the host verifier rejects.
+# The verifier rejects an absent or incomplete final status. Do not reuse this
+# card for another boot: a failed write could leave a previous result in place.
 run pf1006_save
-# Never return to an Android/autoboot fallback, even when a command failed above.
+# Stop here on success or failure. Do not start Android.
 while true; do sleep 60; done

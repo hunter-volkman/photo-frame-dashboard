@@ -44,7 +44,7 @@ def with_egon_checksum(data, length=None):
 
 
 def blank_prefix():
-    before = bytearray(CARD.UP.PREFIX)
+    before = bytearray(CARD.CARD_IO.PREFIX)
     before[510:512] = b"\x55\xaa"
     before[450] = 0x0c
     struct.pack_into("<II", before, 454, 32768, 60000000)
@@ -56,7 +56,7 @@ def disk_info():
         "MediaName": "Synthetic SD card", "TotalSize": CARD_BYTES, "DeviceBlockSize": 512,
         "Internal": False, "WholeDisk": True, "RemovableMedia": True, "BusProtocol": "USB",
         "VirtualOrPhysical": "Physical", "DeviceTreePath": "synthetic-slot",
-        "Content": "FDisk_partition_scheme",
+        "Content": "FDisk_partition_scheme", "Writable": True,
     }
 
 
@@ -208,24 +208,24 @@ class CardTests(unittest.TestCase):
             CARD.load_artifacts(self.build_dir)
 
     def test_card_identity_guards_and_exact_size(self):
-        CARD.UP.EXPECTED_BYTES = CARD_BYTES
+        CARD.CARD_IO.EXPECTED_BYTES = CARD_BYTES
         good = disk_info()
-        with mock.patch.object(CARD.UP, "info", return_value=good):
-            self.assertEqual(CARD.UP.card_disk("disk9")["TotalSize"], CARD_BYTES)
+        with mock.patch.object(CARD.CARD_IO, "info", return_value=good):
+            self.assertEqual(CARD.CARD_IO.card_disk("disk9")["TotalSize"], CARD_BYTES)
         for field, value in (("Internal", True), ("WholeDisk", False), ("RemovableMedia", False),
                              ("BusProtocol", "PCI"), ("VirtualOrPhysical", "Virtual"),
                              ("TotalSize", CARD_BYTES + 512), ("DeviceBlockSize", 4096)):
-            with self.subTest(field=field), mock.patch.object(CARD.UP, "info", return_value=dict(good, **{field: value})):
+            with self.subTest(field=field), mock.patch.object(CARD.CARD_IO, "info", return_value=dict(good, **{field: value})):
                 with self.assertRaises(RuntimeError):
-                    CARD.UP.card_disk("disk9")
-        with mock.patch.object(CARD.UP, "info", side_effect=AssertionError("invalid name reached info")):
+                    CARD.CARD_IO.card_disk("disk9")
+        with mock.patch.object(CARD.CARD_IO, "info", side_effect=AssertionError("invalid name reached info")):
             for disk in ("disk0", "disk9s1", "/dev/disk9", "disk9;echo bad"):
                 with self.assertRaises(RuntimeError):
-                    CARD.UP.card_disk(disk)
+                    CARD.CARD_IO.card_disk(disk)
 
     def test_plan_does_not_create_state_or_run_diskutil(self):
         build = CARD.load_artifacts(self.build_dir)
-        with mock.patch.object(CARD.UP, "info", return_value=disk_info()), contextlib.redirect_stdout(io.StringIO()):
+        with mock.patch.object(CARD.CARD_IO, "info", return_value=disk_info()), contextlib.redirect_stdout(io.StringIO()):
             CARD.plan(build, "disk9", CARD_BYTES)
         self.assertFalse((self.root / "diagnostics").exists())
         self.diskutil.assert_not_called()
@@ -233,13 +233,13 @@ class CardTests(unittest.TestCase):
     def test_cancelled_or_swapped_disk_never_formats(self):
         build = CARD.load_artifacts(self.build_dir)
         with mock.patch.object(CARD.os, "geteuid", return_value=0), mock.patch("builtins.input", return_value="no"), \
-                mock.patch.object(CARD.UP, "info", return_value=disk_info()), contextlib.redirect_stdout(io.StringIO()):
+                mock.patch.object(CARD.CARD_IO, "info", return_value=disk_info()), contextlib.redirect_stdout(io.StringIO()):
             with self.assertRaisesRegex(RuntimeError, "Cancelled"):
                 CARD.prepare(build, "disk9", CARD_BYTES)
         self.assertFalse((self.root / "diagnostics").exists())
         changed = dict(disk_info(), DeviceTreePath="different-reader")
         with mock.patch.object(CARD.os, "geteuid", return_value=0), mock.patch("builtins.input", return_value="ERASE disk9"), \
-                mock.patch.object(CARD.UP, "info", side_effect=[disk_info(), changed]), contextlib.redirect_stdout(io.StringIO()):
+                mock.patch.object(CARD.CARD_IO, "info", side_effect=[disk_info(), changed]), contextlib.redirect_stdout(io.StringIO()):
             with self.assertRaisesRegex(RuntimeError, "changed before format"):
                 CARD.prepare(build, "disk9", CARD_BYTES)
         self.diskutil.assert_not_called()
@@ -253,38 +253,64 @@ class CardTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "already used"):
                 CARD.prepare(build, "disk9", CARD_BYTES)
 
+    def test_locked_card_stops_before_confirmation_or_format(self):
+        build = CARD.load_artifacts(self.build_dir)
+        with mock.patch.object(CARD.os, "geteuid", return_value=0), \
+                mock.patch.object(CARD.CARD_IO, "info", return_value=dict(disk_info(), Writable=False)), \
+                mock.patch("builtins.input", side_effect=AssertionError("must not ask")):
+            with self.assertRaisesRegex(RuntimeError, "Unlock the card"):
+                CARD.prepare(build, "disk9", CARD_BYTES)
+        self.assertFalse((self.root / "diagnostics").exists())
+        self.diskutil.assert_not_called()
+
+    def test_state_update_ignores_leftover_temporary_file(self):
+        work = self.root / "state"
+        work.mkdir()
+        leftover = work / "state.json.tmp"
+        leftover.write_text("interrupted update")
+        CARD.save_state(work, {"phase": "prepared"})
+        CARD.save_state(work, {"phase": "collected"})
+        self.assertEqual(json.loads((work / "state.json").read_text()), {"phase": "collected"})
+        self.assertEqual(leftover.read_text(), "interrupted update")
+        self.assertEqual(list(work.glob(".state-*")), [])
+
+    def test_generic_script_symlink_is_rejected(self):
+        (self.build_dir / "a33.scr").symlink_to(self.root / "missing")
+        with self.assertRaisesRegex(RuntimeError, "Generic a33.scr"):
+            CARD.load_artifacts(self.build_dir)
+
     def test_prefix_gap_existing_loader_and_partition_count_guards(self):
         image = self.files["u-boot-sunxi-with-spl.bin"]
         before = blank_prefix()
-        valid = CARD.UP.planned_prefix(before, image)
-        self.assertEqual(valid[:CARD.UP.OFFSET], before[:CARD.UP.OFFSET])
+        valid = CARD.CARD_IO.planned_prefix(before, image)
+        self.assertEqual(valid[:CARD.CARD_IO.OFFSET], before[:CARD.CARD_IO.OFFSET])
         for changed in (valid, before[:1024]):
             with self.assertRaises(RuntimeError):
-                CARD.UP.planned_prefix(changed, image)
+                CARD.CARD_IO.planned_prefix(changed, image)
         early = bytearray(before)
         struct.pack_into("<I", early, 454, 2048)
         with self.assertRaisesRegex(RuntimeError, "overlaps"):
-            CARD.UP.planned_prefix(bytes(early), image)
+            CARD.CARD_IO.planned_prefix(bytes(early), image)
         extra = bytearray(before)
         extra[466] = 0x0c
         with self.assertRaisesRegex(RuntimeError, "exactly one partition"):
-            CARD.UP.planned_prefix(bytes(extra), image)
+            CARD.CARD_IO.planned_prefix(bytes(extra), image)
 
     def test_fakefile_boot_write_and_restore_preserve_original_prefix(self):
         before = blank_prefix()
         image = self.files["u-boot-sunxi-with-spl.bin"][:-7]  # deliberately not sector-aligned
         raw = self.root / "fake-raw.bin"
         raw.write_bytes(before)
-        with mock.patch.object(CARD.UP.fcntl, "ioctl", return_value=0):
-            CARD.UP.write_boot_image(str(raw), before, image)
-            self.assertEqual(raw.read_bytes(), CARD.UP.planned_prefix(before, image))
+        with mock.patch.object(CARD.CARD_IO.fcntl, "ioctl", return_value=0):
+            CARD.CARD_IO.write_boot_image(str(raw), before, image)
+            self.assertEqual(raw.read_bytes(), CARD.CARD_IO.planned_prefix(before, image))
             CARD.restore_boot_prefix(str(raw), before, image)
         self.assertEqual(raw.read_bytes(), before)
 
     def test_changed_prefix_refuses_restore_without_opening_for_write(self):
         before = blank_prefix()
         image = self.files["u-boot-sunxi-with-spl.bin"]
-        damaged = bytearray(CARD.UP.planned_prefix(before, image))
+        damaged = bytearray(CARD.CARD_IO.planned_prefix(before, image))
         damaged[10000] ^= 1
         raw = self.root / "fake-raw.bin"
         raw.write_bytes(damaged)
@@ -338,7 +364,7 @@ class CardTests(unittest.TestCase):
         work = CARD.configure(build, CARD_BYTES)
         work.mkdir(parents=True)
         CARD.save_state(work, {"run_id": RUN_ID, "phase": "prepared", "artifacts": build["manifest"]["artifacts"]})
-        CARD.UP.STATE.write_text("{}")
+        CARD.CARD_IO.STATE.write_text("{}")
         mount.mkdir()
         (mount / "pf1006-probe.scr").write_bytes(build["data"]["pf1006-probe.scr"])
         return build
@@ -348,7 +374,7 @@ class CardTests(unittest.TestCase):
         build = self.ready_for_collect(mount)
         self.capture_files(mount, "f" * 32)
         with mock.patch.object(CARD.os, "geteuid", return_value=501), \
-                mock.patch.object(CARD.UP, "verify_target", return_value=mount):
+                mock.patch.object(CARD.CARD_IO, "verify_target", return_value=mount):
             with self.assertRaisesRegex(CARD.VERIFY.VerificationError, "run ID mismatch"):
                 CARD.collect(build, "disk9", CARD_BYTES)
         self.assertFalse((self.root / "backups").exists())
@@ -362,56 +388,64 @@ class CardTests(unittest.TestCase):
         destination.mkdir(parents=True)
         (destination / "valuable.txt").write_text("keep me")
         with mock.patch.object(CARD.os, "geteuid", return_value=501), \
-                mock.patch.object(CARD.UP, "verify_target", return_value=mount):
+                mock.patch.object(CARD.CARD_IO, "verify_target", return_value=mount):
             with self.assertRaisesRegex(RuntimeError, "refusing overwrite"):
                 CARD.collect(build, "disk9", CARD_BYTES)
         self.assertEqual((destination / "valuable.txt").read_text(), "keep me")
         self.diskutil.assert_not_called()
 
-    def test_fake_prepare_collect_remove_lifecycle(self):
+    @contextlib.contextmanager
+    def fake_card(self):
+        """Use regular files to model card contents and mount state."""
         build = CARD.load_artifacts(self.build_dir)
         mount = self.root / "card"
         mount.mkdir()
         raw = self.root / "fake-device.bin"
         raw.write_bytes(blank_prefix())
-        mounted = {"value": True}
+        mounted = True
         commands = []
 
-        def fake_info(identifier):
+        def info(identifier):
             if identifier == "disk9":
                 return disk_info()
             self.assertEqual(identifier, "disk9s1")
             result = {"VolumeUUID": "SYNTHETIC", "PartitionMapPartitionOffset": 16 * 1024 * 1024,
                       "IOKitSize": CARD_BYTES - 16 * 1024 * 1024,
                       "FilesystemName": "MS-DOS FAT32", "FilesystemType": "msdos"}
-            if mounted["value"]:
+            if mounted:
                 result["MountPoint"] = str(mount)
             return result
 
-        def fake_diskutil(*args):
+        def diskutil(*args):
+            nonlocal mounted
             commands.append(args)
             if args[0] == "partitionDisk":
                 self.assertEqual(args, ("partitionDisk", "disk9", "MBR", "Free Space", "%noformat%",
-                                        "16M", "MS-DOS FAT32", "PF1006PROBE", "0b"))
+                                       "16M", "MS-DOS FAT32", "PF1006PROBE", "0b"))
                 raw.write_bytes(blank_prefix())
-                mounted["value"] = True
+                mounted = True
             elif args[0] == "mount":
-                mounted["value"] = True
+                mounted = True
             elif args[0] in ("unmountDisk", "eject"):
-                mounted["value"] = False
+                mounted = False
             else:
                 self.fail("Unexpected command: " + str(args))
 
-        with mock.patch.object(CARD, "diskutil", side_effect=fake_diskutil), \
-                mock.patch.object(CARD.UP, "info", side_effect=fake_info), \
+        with mock.patch.object(CARD, "diskutil", side_effect=diskutil), \
+                mock.patch.object(CARD.CARD_IO, "info", side_effect=info), \
                 mock.patch.object(CARD, "raw_device", return_value=str(raw)), \
                 mock.patch.object(CARD.os, "chown"), \
                 mock.patch.object(CARD.fcntl, "ioctl", return_value=0), \
                 contextlib.redirect_stdout(io.StringIO()):
+            yield build, mount, raw, commands
+
+    def test_fake_prepare_collect_remove_lifecycle(self):
+        with self.fake_card() as (build, mount, raw, commands):
             with mock.patch.object(CARD.os, "geteuid", return_value=0), \
                     mock.patch("builtins.input", return_value="ERASE disk9"):
                 CARD.prepare(build, "disk9", CARD_BYTES)
-            self.assertEqual(raw.read_bytes(), CARD.UP.planned_prefix(blank_prefix(), self.files["u-boot-sunxi-with-spl.bin"]))
+            self.assertEqual(raw.read_bytes(), CARD.CARD_IO.planned_prefix(
+                blank_prefix(), self.files["u-boot-sunxi-with-spl.bin"]))
             self.assertEqual((mount / "pf1006-probe.scr").read_bytes(), self.files["pf1006-probe.scr"])
             self.capture_files(mount)
             with mock.patch.object(CARD.os, "geteuid", return_value=501):
@@ -421,65 +455,33 @@ class CardTests(unittest.TestCase):
             with mock.patch.object(CARD.os, "geteuid", return_value=0), \
                     mock.patch("builtins.input", return_value="REMOVE BOOTLOADER disk9"):
                 CARD.remove(build, "disk9", CARD_BYTES)
-        self.assertEqual(raw.read_bytes(), blank_prefix())
-        self.assertIn(("mount", "readOnly", "disk9s1"), commands)
-        self.assertEqual(sum(command[0] == "partitionDisk" for command in commands), 1)
-        self.assertEqual(json.loads((CARD.UP.WORK / "state.json").read_text())["phase"], "removed")
+            self.assertEqual(raw.read_bytes(), blank_prefix())
+            self.assertIn(("mount", "readOnly", "disk9s1"), commands)
+            self.assertEqual(sum(command[0] == "partitionDisk" for command in commands), 1)
+            self.assertEqual(json.loads((CARD.CARD_IO.WORK / "state.json").read_text())["phase"], "removed")
 
     def interrupted_prepare_remove(self, damage_prefix):
-        build = CARD.load_artifacts(self.build_dir)
-        mount = self.root / "card"
-        mount.mkdir()
-        raw = self.root / "fake-device.bin"
-        raw.write_bytes(blank_prefix())
-        mounted = {"value": True}
-        commands = []
         original_save = CARD.save_state
-
-        def fake_info(identifier):
-            if identifier == "disk9":
-                return disk_info()
-            self.assertEqual(identifier, "disk9s1")
-            result = {"VolumeUUID": "SYNTHETIC", "PartitionMapPartitionOffset": 16 * 1024 * 1024,
-                      "IOKitSize": CARD_BYTES - 16 * 1024 * 1024,
-                      "FilesystemName": "MS-DOS FAT32", "FilesystemType": "msdos"}
-            if mounted["value"]:
-                result["MountPoint"] = str(mount)
-            return result
-
-        def fake_diskutil(*args):
-            commands.append(args)
-            if args[0] in ("partitionDisk", "mount"):
-                mounted["value"] = True
-            elif args[0] in ("unmountDisk", "eject"):
-                mounted["value"] = False
-            else:
-                self.fail("Unexpected command: " + str(args))
 
         def fail_final_state_save(work, state):
             if state["phase"] == "prepared":
                 raise RuntimeError("simulated interruption after complete boot write")
             original_save(work, state)
 
-        with mock.patch.object(CARD, "diskutil", side_effect=fake_diskutil), \
-                mock.patch.object(CARD.UP, "info", side_effect=fake_info), \
-                mock.patch.object(CARD, "raw_device", return_value=str(raw)), \
-                mock.patch.object(CARD.os, "chown"), \
-                mock.patch.object(CARD.os, "geteuid", return_value=0), \
-                mock.patch.object(CARD.fcntl, "ioctl", return_value=0), \
-                contextlib.redirect_stdout(io.StringIO()):
+        with self.fake_card() as (build, mount, raw, commands), \
+                mock.patch.object(CARD.os, "geteuid", return_value=0):
             with mock.patch("builtins.input", return_value="ERASE disk9"), \
                     mock.patch.object(CARD, "save_state", side_effect=fail_final_state_save):
                 with self.assertRaisesRegex(RuntimeError, "simulated interruption"):
                     CARD.prepare(build, "disk9", CARD_BYTES)
-            self.assertEqual(raw.read_bytes(), CARD.UP.planned_prefix(
+            self.assertEqual(raw.read_bytes(), CARD.CARD_IO.planned_prefix(
                 blank_prefix(), self.files["u-boot-sunxi-with-spl.bin"]))
-            state_path = CARD.UP.WORK / "state.json"
+            state_path = CARD.CARD_IO.WORK / "state.json"
             self.assertEqual(json.loads(state_path.read_text())["phase"], "prefix_backed_up")
             self.assertNotIn(("eject", "disk9"), commands)
             if damage_prefix:
                 damaged = bytearray(raw.read_bytes())
-                damaged[CARD.UP.OFFSET + 100] ^= 1
+                damaged[CARD.CARD_IO.OFFSET + 100] ^= 1
                 raw.write_bytes(damaged)
             with mock.patch("builtins.input", return_value="REMOVE BOOTLOADER disk9"):
                 if damage_prefix:

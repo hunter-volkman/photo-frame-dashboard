@@ -1,14 +1,16 @@
-"""Host-only tests. Synthetic captures do not validate hardware compatibility."""
+"""Test synthetic captures on the host. Do not access a frame or disk device."""
 
 import contextlib
 import hashlib
 import importlib.util
 import io
 import json
+import os
 import struct
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 SPEC = importlib.util.spec_from_file_location("pf1006_verify", Path(__file__).with_name("verify.py"))
 VERIFY = importlib.util.module_from_spec(SPEC)
@@ -80,7 +82,47 @@ class ProbeVerificationTests(unittest.TestCase):
 
     def test_oversized_prefix(self):
         self.write_capture(self.payload + b"\0")
-        self.assert_rejected("exactly 4 MiB")
+        self.assert_rejected("exceeds 4194304 bytes")
+
+    def test_bytes_api_matches_file_api(self):
+        status = (self.card / VERIFY.STATUS_NAME).read_bytes()
+        self.assertEqual(VERIFY.verify_data(status, self.payload, RUN_ID),
+                         VERIFY.verify(self.card, RUN_ID))
+
+    def test_rejects_symlink_and_directory(self):
+        prefix = self.card / VERIFY.PREFIX_NAME
+        target = self.card / "target.bin"
+        prefix.rename(target)
+        prefix.symlink_to(target)
+        self.assert_rejected("regular file")
+        prefix.unlink()
+        prefix.mkdir()
+        self.assert_rejected("regular file")
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "Host does not support FIFOs")
+    def test_rejects_fifo_without_opening_it(self):
+        prefix = self.card / VERIFY.PREFIX_NAME
+        prefix.unlink()
+        os.mkfifo(prefix)
+        self.assert_rejected("regular file")
+
+    def test_file_growth_cannot_cause_an_unbounded_read(self):
+        path = self.card / "growing.bin"
+        path.write_bytes(b"old")
+        with path.open("rb") as stream:
+            wrapped = mock.MagicMock(wraps=stream)
+            wrapped.__enter__.return_value = wrapped
+
+            def grow_then_read(size):
+                with path.open("ab") as writer:
+                    writer.write(b"x" * 1024)
+                return stream.read(size)
+
+            wrapped.read.side_effect = grow_then_read
+            with mock.patch("builtins.open", return_value=wrapped):
+                with self.assertRaisesRegex(VERIFY.VerificationError, "exceeds 16 bytes"):
+                    VERIFY.read_regular(path, 16)
+            wrapped.read.assert_called_once_with(17)
 
     def test_filler_even_when_hashes_match_and_run_is_unaligned(self):
         data = bytearray(self.payload)
@@ -124,6 +166,21 @@ class ProbeVerificationTests(unittest.TestCase):
         self.write_status()
         self.assert_rejected("missing or unexpected")
 
+    def test_rejects_non_lf_status_lines(self):
+        status = self.card / VERIFY.STATUS_NAME
+        good = status.read_bytes()
+        for separator in (b"\r\n", b"\v", b"\f"):
+            with self.subTest(separator=separator):
+                status.write_bytes(good.replace(b"\n", separator))
+                self.assert_rejected("control character")
+
+    def test_rejects_oversized_status(self):
+        status = self.card / VERIFY.STATUS_NAME
+        status.write_bytes(b"x" * (VERIFY.STATUS_LIMIT + 1))
+        self.assert_rejected("exceeds 16384 bytes")
+        with self.assertRaisesRegex(VERIFY.VerificationError, "status exceeds 16 KiB"):
+            VERIFY.verify_data(status.read_bytes(), self.payload, RUN_ID)
+
     def test_optional_capacity_unknown(self):
         self.fields["extcsd_status"] = "unavailable"
         for key in list(self.fields):
@@ -131,6 +188,25 @@ class ProbeVerificationTests(unittest.TestCase):
                 self.fields[key] = "unknown"
         self.write_status()
         self.assertIsNone(VERIFY.verify(self.card, RUN_ID)["ext_csd_capacity_bytes"])
+
+    def test_partial_optional_register_reads_do_not_imply_capacity(self):
+        self.fields.update(extcsd_status="unavailable", extcsd_sec2="unknown", extcsd_sec3="unknown")
+        self.write_status()
+        report = VERIFY.verify(self.card, RUN_ID)
+        self.assertIsNone(report["ext_csd_capacity_bytes"])
+        self.assertIsNone(report["ext_csd_revision"])
+        self.fields["extcsd_sec3"] = "invalid"
+        self.write_status()
+        self.assert_rejected("invalid EXT_CSD byte")
+
+    def test_rejects_blank_prefix_even_when_hashes_match(self):
+        for value in (b"\0", b"\xff"):
+            with self.subTest(value=value):
+                data = value * VERIFY.PREFIX_BYTES
+                digest = hashlib.sha256(data).hexdigest()
+                self.fields.update(read1_sha256=digest, read2_sha256=digest)
+                self.write_capture(data)
+                self.assert_rejected("entirely zero or 0xFF")
 
     def test_bad_capacity_byte(self):
         self.fields["extcsd_sec3"] = "100"
@@ -148,6 +224,20 @@ class ProbeVerificationTests(unittest.TestCase):
         self.assertEqual(len(findings), 2)
         self.assertNotIn("header_offset", findings[0])
         self.assertNotIn("declared_bytes", findings[1])
+
+    def test_signature_limit_reports_only_actual_omissions(self):
+        for count in (64, 65):
+            with self.subTest(count=count):
+                findings = VERIFY.signature_candidates(b"ANDROID!" * count)
+                self.assertEqual(len(findings), count)
+                self.assertEqual("more_candidates_omitted" in findings[-1], count > 64)
+
+    def test_cli_requires_different_comparison_build(self):
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as error:
+                VERIFY.main([str(self.card), "--run-id", RUN_ID, "--compare", str(self.card),
+                             "--compare-run-id", RUN_ID])
+        self.assertEqual(error.exception.code, 2)
 
     def test_cli_compares_two_verified_captures(self):
         prior = self.card / "prior"
